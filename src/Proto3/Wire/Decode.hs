@@ -22,26 +22,31 @@
 -- This module also provides 'Parser' types and functions for reading messages
 -- from the untyped 'Map' representation obtained from 'decodeWire'.
 
+{-# LANGUAGE ApplicativeDo              #-}
 {-# LANGUAGE BangPatterns               #-}
 {-# LANGUAGE DeriveFunctor              #-}
 {-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE PatternGuards              #-}
+{-# LANGUAGE PatternSynonyms            #-}
+{-# LANGUAGE Rank2Types                 #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE TupleSections              #-}
+{-# LANGUAGE ViewPatterns            #-}
 
 module Proto3.Wire.Decode
     ( -- * Untyped Representation
       ParsedField(..)
     , decodeWire
       -- * Parser Types
-    , Parser(..)
+    , Parser(Parser, runParser)
     , RawPrimitive
     , RawField
     , RawMessage
     , ParseError(..)
     , foldFields
     , parse
+    , fromEither
       -- * Primitives
     , bool
     , int32
@@ -85,6 +90,7 @@ import           Control.Monad           ( msum, foldM )
 import           Data.Bits
 import qualified Data.ByteString         as B
 import qualified Data.ByteString.Lazy    as BL
+import           Data.Either             ( either )
 import           Data.Foldable           ( foldl' )
 import qualified Data.IntMap.Strict      as M -- TODO intmap
 import           Data.Maybe              ( fromMaybe )
@@ -99,6 +105,9 @@ import           Data.Int                ( Int32, Int64 )
 import           Data.Word               ( Word8, Word32, Word64 )
 import           Proto3.Wire.Class
 import           Proto3.Wire.Types
+
+import           Control.Category
+import           Prelude                 hiding (id, (.))
 
 -- $setup
 -- >>> :set -XOverloadedStrings
@@ -140,6 +149,9 @@ decodeWire bstr = drloop bstr []
       let fn = w `shiftR` 3
       (res, rest2) <- takeWT wt rest
       drloop rest2 ((FieldNumber fn,res):xs)
+
+decodeWireErr :: B.ByteString -> Either ParseError [(FieldNumber, ParsedField)]
+decodeWireErr = either (Left . BinaryError . pack) Right . decodeWire
 
 
 eitherUncons :: B.ByteString -> Either String (Word8, B.ByteString)
@@ -235,6 +247,9 @@ data ParseError =
 -- so that 'ParseError' may be used with functions like `throwIO`
 instance Exception ParseError
 
+
+type Result input r a = (a -> input -> r) -> (ParseError -> input -> r) -> input -> r
+
 -- | A parsing function type synonym, to tidy up type signatures.
 --
 -- This synonym is used in three ways:
@@ -248,17 +263,70 @@ instance Exception ParseError
 --
 -- 'Parser's can be combined using the 'Applicative', 'Monad' and 'Alternative'
 -- instances.
-newtype Parser input a = Parser { runParser :: input -> Either ParseError a }
+newtype Parser input a = MkParser {
+    -- Effectively, input -> Either ParseError a
+    -- the extra input is used to ensure that closures over the input aren't required
+    -- and work can be pre-computed
+    unParser :: forall r. (ParseError -> r) ->
+                           (a -> r) ->
+                           (input -> r)
+  }
     deriving Functor
 
+pattern Parser :: (input -> Either ParseError a) -> Parser input a
+pattern Parser{ runParser } <- (runParser' -> runParser) where
+  Parser f = fromEither f
+
+
+runParser' :: Parser i a -> i -> Either ParseError a
+runParser' (MkParser p) = p Left Right
+{-# INLINE runParser' #-}
+
+{-
+
+parseF :: Parser i (DataPoint f)
+parseF = do
+  x <- ..
+  y <- ..
+  DataPoint (...)
+
+
+Global f
+Local r
+
+fallible :: (forall a. Fallible a -> Either ParseError (Maybe a))
+
+(ParseError -> r) -> (a -> r) -> r -> r
+~ Maybe
+
+
+ embedded :: forall m. (a -> m b) -> m b -> Parser RawMessage a -> Parser RawField (m b)
+
+-}
+
 instance Applicative (Parser input) where
-    pure = Parser . const . pure
-    Parser p1 <*> Parser p2 =
-        Parser $ \input -> p1 input <*> p2 input
+    pure x = MkParser $ \_ good _ -> good x
+    MkParser p1 <*> MkParser p2 =
+      MkParser $ \bad good i -> p1 bad (\f -> p2 bad (\a -> good (f a)) i) i
+    liftA2 f (MkParser p1) (MkParser p2) =
+        MkParser $ \bad good i -> p1 bad (\x -> p2 bad (\y -> good (f x y)) i) i
+
 
 instance Monad (Parser input) where
     -- return = pure
-    Parser p >>= f = Parser $ \input -> p input >>= (`runParser` input) . f
+    MkParser p >>= f = MkParser $ \bad good i -> p bad (\a -> unParser (f a) bad good i) i
+
+{-
+instance Alternative (Parser input) where
+    empty = Parser $ \_ _ missing -> missing
+    Parser p1 <|> Parser p2 = Parser $ \good bad missing ->
+      p1 good bad (p2 good bad missing)
+
+combine2 :: (Either ParseError a -> Either ParseError b -> c) -> Parser input a -> Parser input b -> Parser input c
+combine2 f (Parser p1) (Parser p2) = Parser $ \bad good input ->
+  p1 (\e1 -> p2 (\e2 _ -> f (Left e1) (Left e2)) (\x2 _ -> f Nothing (Just b)))
+     (\x1 -> p2 (\e2 _ -> f (Just a) Nothing) (\x2 _ -> f (Just a) (Just b)))
+      -}
 
 -- | Raw data corresponding to a single encoded key/value pair.
 type RawPrimitive = ParsedField
@@ -272,6 +340,17 @@ type RawField = [RawPrimitive]
 -- that 'FieldNumber'.
 type RawMessage = M.IntMap RawField
 
+
+catchParse :: Parser i a -> (ParseError -> Parser i a) -> Parser i a
+catchParse (MkParser p) whenErr = MkParser $ \bad good i -> p (\err -> unParser (whenErr err) bad good i) good i
+{-# INLINE catchParse #-}
+
+instance Category Parser where
+  id = MkParser $ \_ good i -> good i
+  MkParser p1 . MkParser p2 = MkParser $ \bad good ->
+    p2 bad (p1 bad good)
+
+
 -- | Fold over a list of parsed fields accumulating a result
 foldFields :: M.IntMap (Parser RawPrimitive a, a -> acc -> acc)
            -> acc
@@ -282,16 +361,21 @@ foldFields parsers = foldM applyOne
             case M.lookup (fromIntegral . getFieldNumber $ fn) parsers of
                 Nothing              -> pure acc
                 Just (parser, apply) ->
-                    case runParser parser field of
-                        Left err -> Left err
-                        Right a  -> pure $ apply a acc
+                    unParser parser Left (\a -> Right (apply a acc)) field
 
 -- | Parse a message (encoded in the raw wire format) using the specified
 -- `Parser`.
 parse :: Parser RawMessage a -> B.ByteString -> Either ParseError a
-parse parser bs = case decodeWire bs of
-    Left err -> Left (BinaryError (pack err))
-    Right res -> runParser parser (toMap res)
+parse = parseWith Left Right
+{-# INLINE parse #-}
+
+parseWith :: (ParseError -> r) -> (a -> r) -> Parser RawMessage a -> B.ByteString -> r
+parseWith bad good parser bs = either bad (unParser parser bad good . toMap) (decodeWireErr bs)
+{-# INLINE parseWith #-}
+
+{- RULES "either/parse" forall bad good p bs.
+                         either bad good (parse p bs) = parseWith bad good p bs #-}
+
 
 -- | To comply with the protobuf spec, if there are multiple fields with the same
 -- field number, this will always return the last one.
@@ -299,67 +383,75 @@ parsedField :: RawField -> Maybe RawPrimitive
 parsedField xs = case xs of
     [] -> Nothing
     (x:_) -> Just x
+{-# INLINE parsedField #-}
+
+fromEither :: (input -> Either ParseError a) -> Parser input a
+fromEither f = MkParser $ \bad good inp -> either bad good (f inp)
+{-# INLINE fromEither #-}
+
 
 throwWireTypeError :: Show input
                    => String
                    -> input
-                   -> Either ParseError expected
+                   -> ParseError
 throwWireTypeError expected wrong =
-    Left (WireTypeError (pack msg))
+    WireTypeError (pack msg)
   where
     msg = "Wrong wiretype. Expected " ++ expected ++ " but got " ++ show wrong
+{-# NOINLINE throwWireTypeError #-}
 
-throwCerealError :: String -> String -> Either ParseError a
+throwCerealError :: String -> String -> ParseError
 throwCerealError expected cerealErr =
-    Left (BinaryError (pack msg))
+    BinaryError (pack msg)
   where
     msg = "Failed to parse contents of " ++
         expected ++ " field. " ++ "Error from cereal was: " ++ cerealErr
+{-# NOINLINE throwCerealError #-}
 
 parseVarInt :: Integral a => Parser RawPrimitive a
-parseVarInt = Parser $
+parseVarInt = MkParser $ \bad good ->
     \case
-        VarintField i -> Right (fromIntegral i)
-        wrong -> throwWireTypeError "varint" wrong
+        VarintField i -> good (fromIntegral i)
+        wrong -> bad $ throwWireTypeError "varint" wrong
 
 runGetPacked :: Get a -> Parser RawPrimitive a
-runGetPacked g = Parser $
+runGetPacked g = MkParser $ \bad good ->
     \case
         LengthDelimitedField bs ->
             case runGet g bs of
-                Left e -> throwCerealError "packed repeated field" e
-                Right xs -> return xs
-        wrong -> throwWireTypeError "packed repeated field" wrong
+                Left e -> bad $ throwCerealError "packed repeated field" e
+                Right xs -> good xs
+        wrong -> bad $ throwWireTypeError "packed repeated field" wrong
 
 runGetFixed32 :: Get a -> Parser RawPrimitive a
-runGetFixed32 g = Parser $
+runGetFixed32 g = MkParser $ \bad good ->
     \case
         Fixed32Field bs -> case runGet g bs of
-            Left e -> throwCerealError "fixed32 field" e
-            Right x -> return x
-        wrong -> throwWireTypeError "fixed 32 field" wrong
+            Left e -> bad $ throwCerealError "fixed32 field" e
+            Right x -> good x
+        wrong -> bad $ throwWireTypeError "fixed 32 field" wrong
 
 runGetFixed64 :: Get a -> Parser RawPrimitive a
-runGetFixed64 g = Parser $
+runGetFixed64 g = MkParser $ \bad good ->
     \case
         Fixed64Field bs -> case runGet g bs of
-            Left e -> throwCerealError "fixed 64 field" e
-            Right x -> return x
-        wrong -> throwWireTypeError "fixed 64 field" wrong
+            Left e -> bad $ throwCerealError "fixed 64 field" e
+            Right x -> good x
+        wrong -> bad $ throwWireTypeError "fixed 64 field" wrong
 
 bytes :: Parser RawPrimitive B.ByteString
-bytes = Parser $
+bytes = MkParser $ \bad good ->
     \case
         LengthDelimitedField bs ->
-            return $! B.copy bs
-        wrong -> throwWireTypeError "bytes" wrong
+            good $! B.copy bs
+        wrong -> bad $ throwWireTypeError "bytes" wrong
 
 -- | Parse a Boolean value.
 bool :: Parser RawPrimitive Bool
-bool = Parser $
+bool = MkParser $ \bad good ->
     \case
-        VarintField i -> return $! i /= 0
-        wrong -> throwWireTypeError "bool" wrong
+        VarintField i -> good $! i /= 0
+        wrong -> bad $ throwWireTypeError "bool" wrong
 
 -- | Parse a primitive with the @int32@ wire type.
 int32 :: Parser RawPrimitive Int32
@@ -395,14 +487,14 @@ lazyByteString = fmap BL.fromStrict bytes
 
 -- | Parse a primitive with the @bytes@ wire type as 'Text'.
 text :: Parser RawPrimitive Text
-text = Parser $
+text = MkParser $ \bad good ->
     \case
         LengthDelimitedField bs ->
             case decodeUtf8' $ BL.fromStrict bs of
-                Left err -> Left (BinaryError (pack ("Failed to decode UTF-8: " ++
+                Left err -> bad (BinaryError (pack ("Failed to decode UTF-8: " ++
                                                          show err)))
-                Right txt -> return txt
-        wrong -> throwWireTypeError "string" wrong
+                Right txt -> good txt
+        wrong -> bad $ throwWireTypeError "string" wrong
 
 -- | Parse a primitive with an enumerated type.
 --
@@ -485,7 +577,7 @@ sfixed64 = runGetFixed64 getInt64le
 --
 -- > one float `at` fieldNumber 1 :: Parser RawMessage (Maybe Float)
 at :: Parser RawField a -> FieldNumber -> Parser RawMessage a
-at parser fn = Parser $ runParser parser . fromMaybe mempty . M.lookup (fromIntegral . getFieldNumber $ fn)
+at parser fn = MkParser $ \bad good -> unParser parser bad good . M.findWithDefault mempty (fromIntegral . getFieldNumber $ fn)
 
 -- | Try to parse different field numbers with their respective parsers. This is
 -- used to express alternative between possible fields of a oneof.
@@ -503,10 +595,10 @@ oneof :: a
          -- ^ Left-biased oneof field parsers, one per field number belonging to
          -- the oneof
       -> Parser RawMessage a
-oneof def parsersByFieldNum = Parser $ \input ->
+oneof def parsersByFieldNum = MkParser $ \bad good input ->
   case msum ((\(num,p) -> (p,) <$> M.lookup (fromIntegral . getFieldNumber $ num) input) <$> parsersByFieldNum) of
-    Nothing     -> pure def
-    Just (p, v) -> runParser p v
+    Nothing     -> good def
+    Just (p, v) -> unParser p bad good v
 
 -- | This turns a primitive parser into a field parser by keeping the
 -- last received value, or return a default value if the field number is missing.
@@ -521,7 +613,8 @@ oneof def parsersByFieldNum = Parser $ \input ->
 --
 -- > one float 0 :: Parser RawField Float
 one :: Parser RawPrimitive a -> a -> Parser RawField a
-one parser def = Parser (fmap (fromMaybe def) . traverse (runParser parser) . parsedField)
+one parser def = MkParser $ \bad good i ->
+  maybe (good def) (unParser parser bad good) (parsedField i)
 
 -- | Parse a repeated field, or an unpacked collection of primitives.
 --
@@ -536,19 +629,29 @@ one parser def = Parser (fmap (fromMaybe def) . traverse (runParser parser) . pa
 --
 -- > repeated . embedded' :: Parser RawMessage a -> Parser RawField ([a])
 repeated :: Parser RawPrimitive a -> Parser RawField [a]
-repeated parser = Parser $ fmap reverse . mapM (runParser parser)
+repeated parser = do
+  i <- id
+  result <- mapM (thunkParser parser) i
+  pure (reverse result)
+{-# NOINLINE repeated #-}
+
+
+throwEmbeddedParseError :: ParseError
+                        -> ParseError
+throwEmbeddedParseError err = EmbeddedError "Failed to parse embedded message. " (Just err)
 
 -- | For a field containing an embedded message, parse as far as getting the
 -- wire-level fields out of the message.
-embeddedToParsedFields :: RawPrimitive -> Either ParseError RawMessage
-embeddedToParsedFields (LengthDelimitedField bs) =
-    case decodeWire bs of
-        Left err -> Left (EmbeddedError ("Failed to parse embedded message: "
-                                             <> (pack err))
-                                        Nothing)
-        Right result -> return (toMap result)
-embeddedToParsedFields wrong =
-    throwWireTypeError "embedded" wrong
+embeddedToParsedFields :: Parser RawPrimitive RawMessage
+embeddedToParsedFields = MkParser $ \bad good ->
+  \case
+    (LengthDelimitedField bs) -> either (bad . throwEmbeddedParseError) (good . toMap) (decodeWireErr bs)
+    wrong -> bad $ throwWireTypeError "embedded" wrong
+
+
+thunkParser :: (Parser i x) -> i -> Parser any x
+thunkParser (MkParser p) i = MkParser $ \bad good _ -> p bad good i
+
 
 -- | Create a field parser for an embedded message, from a message parser.
 --
@@ -560,28 +663,25 @@ embeddedToParsedFields wrong =
 -- If the embedded message is not found in the outer message, this function
 -- returns 'Nothing'.
 embedded :: Parser RawMessage a -> Parser RawField (Maybe a)
-embedded p = Parser $
-    \xs -> if xs == empty
-           then return Nothing
-           else do
-               innerMaps <- T.mapM embeddedToParsedFields xs
-               let combinedMap = foldl' (M.unionWith (<>)) M.empty innerMaps
-               parsed <- runParser p combinedMap
-               return $ Just parsed
+embedded p = do
+    xs <- id
+    if null xs then pure Nothing
+    else do
+      innerMaps <- T.mapM (thunkParser embeddedToParsedFields) xs
+      let combinedMap = foldl' (M.unionWith (<>)) M.empty innerMaps
+      MkParser $ \bad good _ -> unParser p bad (good . Just) combinedMap
+{-# NOINLINED embedded #-}
 
 -- | Create a primitive parser for an embedded message from a message parser.
 --
 -- This parser does no merging of fields if multiple message fragments are
 -- sent separately.
 embedded' :: Parser RawMessage a -> Parser RawPrimitive a
-embedded' parser = Parser $
+embedded' parser = MkParser $ \bad good ->
     \case
         LengthDelimitedField bs ->
-            case parse parser bs of
-                Left err -> Left (EmbeddedError "Failed to parse embedded message."
-                                                (Just err))
-                Right result -> return result
-        wrong -> throwWireTypeError "embedded" wrong
+            parseWith (bad . throwEmbeddedParseError) good
+                      parser bs
+        wrong -> bad $ throwWireTypeError "embedded" wrong
+{-# NOINLINED embedded' #-}
 
-
--- TODO test repeated and embedded better for reverse logic...
