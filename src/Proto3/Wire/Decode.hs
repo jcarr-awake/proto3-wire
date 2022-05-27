@@ -548,26 +548,32 @@ packedFixed64 = fmap (fmap fromIntegral) (runGetPacked (many getWord64le))
 -- | Parse a @float@.
 float :: Parser RawPrimitive Float
 float = runGetFixed32 getFloat32le
+{-# INLINE float #-}
 
 -- | Parse a @double@.
 double :: Parser RawPrimitive Double
 double = runGetFixed64 getFloat64le
+{-# INLINE double #-}
 
 -- | Parse an integer primitive with the @fixed32@ wire type.
 fixed32 :: Parser RawPrimitive Word32
 fixed32 = runGetFixed32 getWord32le
+{-# INLINE fixed32 #-}
 
 -- | Parse an integer primitive with the @fixed64@ wire type.
 fixed64 :: Parser RawPrimitive Word64
 fixed64 = runGetFixed64 getWord64le
+{-# INLINE fixed64 #-}
 
 -- | Parse a signed integer primitive with the @fixed32@ wire type.
 sfixed32 :: Parser RawPrimitive Int32
 sfixed32 = runGetFixed32 getInt32le
+{-# INLINE sfixed32 #-}
 
 -- | Parse a signed integer primitive with the @fixed64@ wire type.
 sfixed64 :: Parser RawPrimitive Int64
 sfixed64 = runGetFixed64 getInt64le
+{-# INLINE sfixed64 #-}
 
 -- | Turn a field parser into a message parser, by specifying the 'FieldNumber'.
 --
@@ -578,6 +584,7 @@ sfixed64 = runGetFixed64 getInt64le
 -- > one float `at` fieldNumber 1 :: Parser RawMessage (Maybe Float)
 at :: Parser RawField a -> FieldNumber -> Parser RawMessage a
 at parser fn = MkParser $ \bad good -> unParser parser bad good . M.findWithDefault mempty (fromIntegral . getFieldNumber $ fn)
+{-# INLINE at #-}
 
 -- | Try to parse different field numbers with their respective parsers. This is
 -- used to express alternative between possible fields of a oneof.
@@ -633,7 +640,6 @@ repeated parser = do
   i <- id
   result <- mapM (thunkParser parser) i
   pure (reverse result)
-{-# NOINLINE repeated #-}
 
 
 throwEmbeddedParseError :: ParseError
@@ -670,7 +676,6 @@ embedded p = do
       innerMaps <- T.mapM (thunkParser embeddedToParsedFields) xs
       let combinedMap = foldl' (M.unionWith (<>)) M.empty innerMaps
       MkParser $ \bad good _ -> unParser p bad (good . Just) combinedMap
-{-# NOINLINED embedded #-}
 
 -- | Create a primitive parser for an embedded message from a message parser.
 --
@@ -683,5 +688,4 @@ embedded' parser = MkParser $ \bad good ->
             parseWith (bad . throwEmbeddedParseError) good
                       parser bs
         wrong -> bad $ throwWireTypeError "embedded" wrong
-{-# NOINLINED embedded' #-}
 
