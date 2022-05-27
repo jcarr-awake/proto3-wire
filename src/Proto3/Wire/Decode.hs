@@ -306,10 +306,17 @@ fallible :: (forall a. Fallible a -> Either ParseError (Maybe a))
 
 instance Applicative (Parser input) where
     pure x = MkParser $ \_ good _ -> good x
-    MkParser p1 <*> MkParser p2 =
-      MkParser $ \bad good i -> p1 bad (\f -> p2 bad (\a -> good (f a)) i) i
+    MkParser p1 <*> MkParser p2 = MkParser $ \bad good i ->
+      p1 bad (\f -> p2 bad (\x -> good (f x)) i) i
     liftA2 f (MkParser p1) (MkParser p2) =
-        MkParser $ \bad good i -> p1 bad (\x -> p2 bad (\y -> good (f x y)) i) i
+        MkParser $ \bad good ->
+          let p1' = p1 (Left . bad) Right
+              p2' = p2 (Left . bad) Right
+          in \i ->
+          case (p1' i, p2' i) of
+            (Right x, Right y) -> good (f x y)
+            (Left er, _) -> er
+            (_, Left er) -> er
 
 
 instance Monad (Parser input) where
@@ -688,4 +695,4 @@ embedded' parser = MkParser $ \bad good ->
             parseWith (bad . throwEmbeddedParseError) good
                       parser bs
         wrong -> bad $ throwWireTypeError "embedded" wrong
-
+{-# INLINE embedded' #-}
