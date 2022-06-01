@@ -310,13 +310,13 @@ instance Applicative (Parser input) where
       p1 bad (\f -> p2 bad (\x -> good (f x)) i) i
     liftA2 f (MkParser p1) (MkParser p2) =
         MkParser $ \bad good ->
-          let p1' = p1 (Left . bad) Right
-              p2' = p2 (Left . bad) Right
+          let p1' = p1 Left Right
+              p2' = p2 Left Right
           in \i ->
           case (p1' i, p2' i) of
             (Right x, Right y) -> good (f x y)
-            (Left er, _) -> er
-            (_, Left er) -> er
+            (Left err, _) -> bad err
+            (_, Left err) -> bad err
 
 
 instance Monad (Parser input) where
@@ -590,8 +590,12 @@ sfixed64 = runGetFixed64 getInt64le
 --
 -- > one float `at` fieldNumber 1 :: Parser RawMessage (Maybe Float)
 at :: Parser RawField a -> FieldNumber -> Parser RawMessage a
-at parser fn = MkParser $ \bad good -> unParser parser bad good . M.findWithDefault mempty (fromIntegral . getFieldNumber $ fn)
-{-# INLINE at #-}
+at parser fn = MkParser $ \bad good i ->
+  let p = unParser parser bad good
+  -- lookup has constructor overhead but exposes `p mempty` to GHC
+  in case M.lookup (fromIntegral . getFieldNumber $ fn) i of
+    Nothing -> p mempty
+    Just a -> p a
 
 -- | Try to parse different field numbers with their respective parsers. This is
 -- used to express alternative between possible fields of a oneof.
@@ -645,8 +649,12 @@ one parser def = MkParser $ \bad good i ->
 repeated :: Parser RawPrimitive a -> Parser RawField [a]
 repeated parser = do
   i <- id
-  result <- mapM (thunkParser parser) i
-  pure (reverse result)
+  treverse (thunkParser parser) i
+  where
+    -- traverses but builds up the list in reverse
+    treverse :: Applicative f => (a -> f b) -> [a] -> f [b]
+    treverse f = foldl (\rest a -> (:) <$> f a <*> rest) (pure [])
+{-# INLINE repeated #-}
 
 
 throwEmbeddedParseError :: ParseError
