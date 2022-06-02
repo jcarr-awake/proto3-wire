@@ -87,12 +87,17 @@ import           Control.Applicative
 import           Control.Arrow (first)
 import           Control.Exception       ( Exception )
 import           Control.Monad           ( msum, foldM )
+import           Control.Monad.Trans.Except
+import           Control.Monad.Trans.State.Strict
 import           Data.Bits
 import qualified Data.ByteString         as B
 import qualified Data.ByteString.Lazy    as BL
+import           Data.Coerce             ( coerce )
 import           Data.Either             ( either )
+import           Data.Functor.Identity
 import           Data.Foldable           ( foldl' )
 import qualified Data.IntMap.Strict      as M -- TODO intmap
+import qualified Data.List               as L
 import           Data.Maybe              ( fromMaybe )
 import           Data.Serialize.Get      ( Get, getWord8, getInt32le
                                          , getInt64le, getWord32le, getWord64le
@@ -161,69 +166,94 @@ toMap kvs0 = makeMap . map (first (fromIntegral . getFieldNumber)) $ kvs0
              in Just (m', k1, [a1])
 
 -- | Parses data in the raw wire format into an untyped 'Map' representation.
-decodeWire :: B.ByteString -> Either String [(FieldNumber, ParsedField)]
-decodeWire bstr = drloop bstr []
+-- Failures are accumulated for each individual field.
+--
+-- If the FieldNumber itself was unparseable, then a lage, invalid value is used
+--
+decodeWireLazy :: B.ByteString -> [(FieldNumber, Either String ParsedField)]
+decodeWireLazy = L.unfoldr pickOne
  where
-   drloop !bs xs | B.null bs = Right $ reverse xs
-   drloop !bs xs | otherwise = do
-      (w, rest) <- takeVarInt bs
-      wt <- gwireType $ fromIntegral (w .&. 7)
-      let fn = w `shiftR` 3
-      (res, rest2) <- takeWT wt rest
-      drloop rest2 ((FieldNumber fn,res):xs)
+   pickOne :: B.ByteString -> Maybe ((FieldNumber, Either String ParsedField), B.ByteString)
+   pickOne !bs | B.null bs = Nothing
+   pickOne !bs | otherwise = Just $
+    case runTakeBS (takeSmallVarInt $ \_ -> throwE "Failed to parse key; too big") bs of
+      (Left err, bs') -> ((FieldNumber maxBound, Left err), bs')
+      (Right w, bs') ->
+        let fn = w `shiftR` 3
+            finalize (x, bs) = ((FieldNumber fn, x), bs)
+        in finalize . flip runTakeBS bs' $ do
+          wt <- except . gwireType $ fromIntegral (w .&. 7)
+          res <- takeWT wt
+          pure res
+
+-- | Parses data in the raw wire format into an untyped 'Map' representation.
+decodeWire :: B.ByteString -> Either String [(FieldNumber, ParsedField)]
+decodeWire = traverse strength . decodeWireLazy
+  where
+    strength (a, fb) = (a,) <$> fb
 
 decodeWireErr :: B.ByteString -> Either ParseError [(FieldNumber, ParsedField)]
 decodeWireErr = either (Left . BinaryError . pack) Right . decodeWire
 
 
-eitherUncons :: B.ByteString -> Either String (Word8, B.ByteString)
-eitherUncons = maybe (Left "failed to parse varint128") Right . B.uncons
+type TakeBS = ExceptT String (StateT B.ByteString Identity)
+
+takeBS :: (B.ByteString -> (Either String a, B.ByteString)) -> TakeBS a
+takeBS = coerce
+
+runTakeBS :: TakeBS a -> B.ByteString -> (Either String a, B.ByteString)
+runTakeBS = coerce
 
 
-takeVarInt :: B.ByteString -> Either String (Word64, B.ByteString)
-takeVarInt !bs =
+takeByte :: TakeBS Word8
+takeByte = takeBS $ \bs ->
   case B.uncons bs of
-     Nothing -> Right (0, B.empty)
-     Just (w1, r1) -> do
-       if w1 < 128 then return (fromIntegral w1, r1) else do
-        let val1 = fromIntegral (w1 - 0x80)
+    Nothing -> (Left "failed to parse varint128", bs)
+    Just (x, rest) -> (Right x, rest)
 
-        (w2,r2) <- eitherUncons r1
-        if w2 < 128 then return (val1 + (fromIntegral w2 `shiftL` 7), r2) else do
-         let val2 = (val1 + (fromIntegral (w2 - 0x80) `shiftL` 7))
-
-         (w3,r3) <- eitherUncons r2
-         if w3 < 128 then return (val2 + (fromIntegral w3 `shiftL` 14), r3) else do
+takeSmallVarInt :: (Num w, Bits w) => (w -> TakeBS w) -> TakeBS w
+takeSmallVarInt largeK = do
+    w1 <- takeByte
+    if w1 < 128 then return (fromIntegral w1) else do
+      let val1 = fromIntegral (w1 - 0x80)
+      w2 <- takeByte
+      if w2 < 128 then return (val1 + (fromIntegral w2 `shiftL` 7)) else do
+        let val2 = (val1 + (fromIntegral (w2 - 0x80) `shiftL` 7))
+        w3 <- takeByte
+        if w3 < 128 then return (val2 + (fromIntegral w3 `shiftL` 14)) else do
           let val3 = (val2 + (fromIntegral (w3 - 0x80) `shiftL` 14))
+          w4 <- takeByte
+          if w4 < 128 then return (val3 + (fromIntegral w4 `shiftL` 21)) else do
+            let val4 = (val3 + (fromIntegral (w4 - 0x80) `shiftL` 21))
+            largeK val4
+{-# INLINE takeSmallVarInt #-}
 
-          (w4,r4) <- eitherUncons r3
-          if w4 < 128 then return (val3 + (fromIntegral w4 `shiftL` 21), r4) else do
-           let val4 = (val3 + (fromIntegral (w4 - 0x80) `shiftL` 21))
-
-           (w5,r5) <- eitherUncons r4
-           if w5 < 128 then return (val4 + (fromIntegral w5 `shiftL` 28), r5) else do
+takeVarInt :: TakeBS Word64
+takeVarInt = takeSmallVarInt $ \val4 -> do
+           w5 <- takeByte
+           if w5 < 128 then return (val4 + (fromIntegral w5 `shiftL` 28)) else do
             let val5 = (val4 + (fromIntegral (w5 - 0x80) `shiftL` 28))
 
-            (w6,r6) <- eitherUncons r5
-            if w6 < 128 then return (val5 + (fromIntegral w6 `shiftL` 35), r6) else do
+            w6 <- takeByte
+            if w6 < 128 then return (val5 + (fromIntegral w6 `shiftL` 35)) else do
              let val6 = (val5 + (fromIntegral (w6 - 0x80) `shiftL` 35))
 
-             (w7,r7) <- eitherUncons r6
-             if w7 < 128 then return (val6 + (fromIntegral w7 `shiftL` 42), r7) else do
+             w7 <- takeByte
+             if w7 < 128 then return (val6 + (fromIntegral w7 `shiftL` 42)) else do
               let val7 = (val6 + (fromIntegral (w7 - 0x80) `shiftL` 42))
 
-              (w8,r8) <- eitherUncons r7
-              if w8 < 128 then return (val7 + (fromIntegral w8 `shiftL` 49), r8) else do
+              w8 <- takeByte
+              if w8 < 128 then return (val7 + (fromIntegral w8 `shiftL` 49)) else do
                let val8 = (val7 + (fromIntegral (w8 - 0x80) `shiftL` 49))
 
-               (w9,r9) <- eitherUncons r8
-               if w9 < 128 then return (val8 + (fromIntegral w9 `shiftL` 56), r9) else do
+               w9 <- takeByte
+               if w9 < 128 then return (val8 + (fromIntegral w9 `shiftL` 56)) else do
                 let val9 = (val8 + (fromIntegral (w9 - 0x80) `shiftL` 56))
 
-                (w10,r10) <- eitherUncons r9
-                if w10 < 128 then return (val9 + (fromIntegral w10 `shiftL` 63), r10) else do
+                w10 <- takeByte
+                if w10 < 128 then return (val9 + (fromIntegral w10 `shiftL` 63)) else do
 
-                 Left ("failed to parse varint128: too big; " ++ show val6)
+                 throwE ("failed to parse varint128: too big; " ++ show val6)
 
 
 gwireType :: Word8 -> Either String WireType
@@ -233,17 +263,19 @@ gwireType 1 = return Fixed64
 gwireType 2 = return LengthDelimited
 gwireType wt = Left $ "wireType got unknown wire type: " ++ show wt
 
-safeSplit :: Int -> B.ByteString -> Either String (B.ByteString, B.ByteString)
-safeSplit !i !b | B.length b < i = Left "failed to parse varint128: not enough bytes"
-                | otherwise = Right $ B.splitAt i b
+safeSplit :: Int -> TakeBS B.ByteString
+safeSplit !i = takeBS $ \b ->
+  if (B.length b < i)
+      then (Left ("failed to parse varint128: not enough bytes"), mempty)
+      else (\(x, y) -> (Right x, y)) $ B.splitAt i b
 
-takeWT :: WireType -> B.ByteString -> Either String (ParsedField, B.ByteString)
-takeWT Varint !b  = fmap (first VarintField) $ takeVarInt b
-takeWT Fixed32 !b = fmap (first Fixed32Field) $ safeSplit 4 b
-takeWT Fixed64 !b = fmap (first Fixed64Field) $ safeSplit 8 b
-takeWT LengthDelimited b = do
-   (!len, rest) <- takeVarInt b
-   fmap (first LengthDelimitedField) $ safeSplit (fromIntegral len) rest
+takeWT :: WireType -> TakeBS ParsedField
+takeWT Varint = VarintField <$> takeVarInt
+takeWT Fixed32 = Fixed32Field <$> safeSplit 4
+takeWT Fixed64 = Fixed64Field <$> safeSplit 8
+takeWT LengthDelimited = do
+     !len <- takeVarInt
+     LengthDelimitedField <$> safeSplit (fromIntegral len)
 
 
 -- * Parser Interface

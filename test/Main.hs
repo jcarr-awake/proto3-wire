@@ -77,6 +77,8 @@ data StringOrInt64 = TString T.Text | TInt64 Int64
 
 instance QC.Arbitrary StringOrInt64 where
     arbitrary = QC.oneof [ TString . T.pack <$> QC.arbitrary, TInt64 <$> QC.arbitrary ]
+    shrink (TString txt) = TString . T.pack <$> (QC.shrink . T.unpack $ txt)
+    shrink (TInt64 i) = TInt64 <$> QC.shrink i
 
 -- This just stress tests the fancy varint encodings with more randomness.
 varIntHeavyTests :: TestTree
@@ -228,7 +230,7 @@ roundTrip name encode decode =
         \x -> do
             let bytes = Encode.toLazyByteString (encode x)
             case Decode.parse decode (BL.toStrict bytes) of
-                Left _ -> error "Could not decode encoded message"
+                Left e -> error ("Could not decode encoded message: " ++ show e)
                 Right x' -> x === x'
 
 buildSingleChunk :: TestTree
