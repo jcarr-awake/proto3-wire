@@ -77,6 +77,9 @@ module Proto3.Wire.Decode
     , repeated
     , embedded
     , embedded'
+    , embeddedDelayed'
+
+    , unwrapParser
       -- * ZigZag codec
     , zigZagDecode
       -- * Exported For Doctest Only
@@ -170,8 +173,8 @@ decodeWire = traverse strength . decodeWireLazy
   where
     strength (a, fb) = (a,) <$> fb
 
-decodeWireErr :: B.ByteString -> Either ParseError [(FieldNumber, ParsedField)]
-decodeWireErr = either (Left . BinaryError . pack) Right . decodeWire
+decodeWireErr :: (ParseError -> r) -> ([(FieldNumber, ParsedField)] -> r) -> B.ByteString -> r
+decodeWireErr bad good = either (bad . BinaryError . pack) good . decodeWire
 
 
 type TakeBS = ExceptT String (StateT B.ByteString Identity)
@@ -314,6 +317,13 @@ runParser' :: Parser i a -> i -> Either ParseError a
 runParser' (MkParser p) = p Left Right
 {-# INLINE runParser' #-}
 
+
+unwrapParser :: Parser i (Either ParseError a) -> Parser i a
+unwrapParser (MkParser p) = MkParser $ \bad good ->
+  let catch (Left e) = bad e
+      catch (Right x) = good x
+  in p bad catch
+
 {-
 
 parseF :: Parser i (DataPoint f)
@@ -409,7 +419,7 @@ parse = parseWith Left Right
 {-# INLINE parse #-}
 
 parseWith :: (ParseError -> r) -> (a -> r) -> Parser RawMessage a -> B.ByteString -> r
-parseWith bad good parser bs = either bad (unParser parser bad good . toMap) (decodeWireErr bs)
+parseWith bad good parser = decodeWireErr bad (unParser parser bad good . toMap)
 {-# INLINE parseWith #-}
 
 {- RULES "either/parse" forall bad good p bs.
@@ -698,7 +708,7 @@ throwEmbeddedParseError err = EmbeddedError "Failed to parse embedded message. "
 embeddedToParsedFields :: Parser RawPrimitive RawMessage
 embeddedToParsedFields = MkParser $ \bad good ->
   \case
-    (LengthDelimitedField bs) -> either (bad . throwEmbeddedParseError) (good . toMap) (decodeWireErr bs)
+    (LengthDelimitedField bs) -> decodeWireErr (bad . throwEmbeddedParseError) (good . toMap) bs
     wrong -> bad $ throwWireTypeError "embedded" wrong
 
 
@@ -736,3 +746,12 @@ embedded' parser = MkParser $ \bad good ->
                       parser bs
         wrong -> bad $ throwWireTypeError "embedded" wrong
 {-# INLINE embedded' #-}
+
+embeddedDelayed' :: Parser RawMessage a -> Parser RawPrimitive (Either ParseError (B.ByteString, a))
+embeddedDelayed' parser = MkParser $ \_ good ->
+    \case
+        LengthDelimitedField bs -> good $
+            parseWith (Left . throwEmbeddedParseError) (Right . (bs,))
+                      parser bs
+        wrong -> good . Left $ throwWireTypeError "embedded" wrong
+{-# INLINE embeddedDelayed' #-}
