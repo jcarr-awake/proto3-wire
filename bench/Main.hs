@@ -5,6 +5,7 @@
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 
@@ -72,6 +73,10 @@ instance (Show (f (Tree f a)), Show a) => Show (Tree f a) where
   showsPrec _ Leaf = ('*':)
   showsPrec _ (Branch x t1 t2) =
     ('(' :) . shows t1 . ("<-(" ++) . shows x . ("->(" ++) .  shows t2 . (')' :)
+
+treeHomM :: (Monad m, Traversable f) => (forall x. f x -> m (g x)) -> Tree f a -> m (Tree g a)
+treeHomM f Leaf = pure Leaf
+treeHomM f (Branch x l r) = Branch x <$> (traverse (treeHomM f) l >>= f) <*> (traverse (treeHomM f) r >>= f)
 
 type UnparsedTreeRec f a = Either De.ParseError (B.ByteString, Tree f a) -> Either De.ParseError (f (Tree f a))
 
@@ -252,7 +257,7 @@ modifyTree (Branch x b t3) = Branch x b' t3
 modifyTree t = t
 
 updateSmart :: Tree Delayed Word64 -> IO B.ByteString
-updateNaive :: Tree Delayed Word64 -> IO B.ByteString
+updateNaive :: Traversable f => Tree f Word64 -> IO B.ByteString
 updateSmart t =
   let t' = modifyTree t
       encoded = smartIntTreeEncoder (pure t) (pure t')
@@ -268,7 +273,17 @@ main = do
       f tree = bgroup "Modifies"
                 [ bench "Modify smart" (C.nfIO $ updateSmart tree)
                 , bench "Modify naive" (C.nfIO $ updateNaive tree)
+                , C.env stripDelayed $ bench "baseline" . C.nfIO . updateNaive
                 ]
+        where
+          toIdentity :: Delayed x -> Either De.ParseError (Identity x)
+          toIdentity (Compose (Left err)) = Left err
+          toIdentity (Compose (Right (_, x))) = Right (Identity x)
+
+          stripDelayed :: IO (Tree Identity Word64)
+          stripDelayed = do
+            Right t <- pure $ treeHomM toIdentity tree
+            pure t
   defaultMain
     [ bench "Parse int tree" $ C.perBatchEnv (const mkTree) decodeW
     , C.env mkSmart f
