@@ -69,7 +69,7 @@ test-suite tests
 benchmark bench
   type:                exitcode-stdio-1.0
   main-is:             Main.hs
-  build-depends:       base >= 4 && < 5, bytestring, deepseq, random, criterion, pretty-show, proto3-wire
+  build-depends:       base >= 4 && < 5, bytestring, deepseq, random, containers, criterion, pretty-show, proto3-wire
   hs-source-dirs:      bench
   ghc-options:         -O2 -Wall -fobject-code -ddump-simpl -ddump-to-file
 

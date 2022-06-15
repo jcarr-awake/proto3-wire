@@ -18,9 +18,12 @@ import qualified Proto3.Wire.Encode as En
 import Proto3.Wire
 
 import Control.Applicative (liftA3)
+import Control.Monad (forM)
+import Data.List (sortOn)
 import Data.Maybe
 import Data.Word
 import Data.IORef
+import qualified Data.IntMap.Strict      as M -- TODO intmap
 
 import Criterion (bgroup, bench)
 import qualified Criterion as C
@@ -284,7 +287,49 @@ main = do
           stripDelayed = do
             Right t <- pure $ treeHomM toIdentity tree
             pure t
+      _ = f
+      mkUnsorted = do
+        let gi :: IO Int
+            gi = (`mod` 32) <$> randomIO
+        length <- (30+) <$> gi
+        forM (replicate length ()) $ \() -> (,) <$> gi <*> gi
+
+      benchIntMap :: ([(Int, Int)], [(Int, Int)]) -> C.Benchmark
+      benchIntMap ~(inps1, inps2) = bgroup "IntMap"
+            [ C.env fullSorted   $ \i -> bench "Distinct" (C.nf toMapDistinct i)
+            , C.env fullInps     $ \i -> bench "Raw" (C.nf (M.fromListWith (+)) i)
+            , C.env fullInps     $ \i -> bench "FastUnsorted" (C.nf fastMap i)
+            , C.env sortedPrefix $ \i -> bench "FastPrefix" (C.nf fastMap i)
+            , C.env sortedSuffix $ \i -> bench "FastSuffix" (C.nf fastMap i)
+            , C.env fullSorted   $ \i -> bench "FastSorted" (C.nf fastMap i)
+            ]
+        where
+          fullInps = pure $ inps1 ++ inps2
+          sortedPrefix = pure $ (combineDup $ sortOn fst inps1) ++ inps2
+          sortedSuffix = pure $ inps1 ++ (combineDup $ sortOn fst inps2)
+          fullSorted = combineDup . sortOn fst <$> fullInps
+
+          toMapDistinct = M.fromDistinctAscList
+
+          combineDup [] = []
+          combineDup ((k1, a1) : (k2, a2) : rest) | k1 == k2
+            = combineDup ((k1, a1 + a2) : rest)
+          combineDup (pair : rest) = pair : combineDup rest
+
+          fastMap = foldr combineSeen (M.empty, Nothing)
+          combineSeen x (_, Nothing) = (M.empty, Just x)
+          combineSeen (k1, a1) (m, Just (k2, a2)) =
+            case compare k1 k2 of
+              EQ -> (m, Just (k1, a1 + a2))
+              LT -> let !m' = M.insert k2 a2 m
+                    in (m', Just (k1, a1))
+              GT -> let !m' = M.insertWith (+) k1 a1 m
+                    in (m', Just (k2, a2))
+
   defaultMain
+    [ C.env ((,) <$> mkUnsorted <*> mkUnsorted) benchIntMap ]
+{-
     [ bench "Parse int tree" $ C.perBatchEnv (const mkTree) decodeW
     , C.env mkSmart f
     ]
+    -}
