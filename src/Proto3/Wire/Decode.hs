@@ -74,6 +74,8 @@ module Proto3.Wire.Decode
     , embedded'
       -- * ZigZag codec
     , zigZagDecode
+      -- * For testing
+    , decodeWire0
     ) where
 
 import           Control.Applicative
@@ -158,6 +160,7 @@ decodeWire0 cl z finish bstr = drloop bstr z
       let fn = w `shiftR` 3
       (res, rest2) <- takeWT wt rest
       drloop rest2 (cl xs (FieldNumber fn) res)
+{-# INLINE decodeWire0 #-}
 
 eitherUncons :: B.ByteString -> Either String (Word8, B.ByteString)
 eitherUncons = maybe (Left "failed to parse varint128") Right . B.uncons

@@ -31,7 +31,8 @@ import qualified Data.ByteString.Builder.Internal as BBI
 import           Data.Either           ( isLeft )
 import           Data.Maybe            ( fromMaybe )
 import           Data.Int
-import           Data.List             ( group )
+import qualified Data.IntMap           as M
+import           Data.List             ( foldl', group )
 import qualified Data.Text.Lazy        as T
 import qualified Data.Vector           as V
 import           Data.Word             ( Word8, Word64 )
@@ -70,6 +71,7 @@ tests = testGroup "Tests" [ roundTripTests
                           , decodeNonsense
                           , varIntHeavyTests
                           , packedLargeTests
+                          , decodeWireFoldlOld
                           ]
 
 data StringOrInt64 = TString T.Text | TInt64 Int64
@@ -727,3 +729,23 @@ packedDoublesV_large = HU.testCase "Large packedDoublesV" $ do
       decoded = Decode.parse (one Decode.packedDoubles [] `at` fieldNumber 13)
                              (BL.toStrict encoded)
   HU.assertEqual "round trip" (Right [2 .. count + 1]) decoded
+
+data InsertionOrder a
+  = First a
+  | Then (InsertionOrder a) (InsertionOrder a)
+  deriving (Eq, Show)
+
+decodeWireFoldlOld :: TestTree
+decodeWireFoldlOld = QC.testProperty "decodeWire vs foldl" $
+  \is ->
+    let inpKvs = map (\(k,v) -> (abs k, v)) (is :: [(Int, Word64)])
+        encoded = BL.toStrict . Encode.toLazyByteString $
+                      foldMap (\(k, v) -> Encode.uint64 (fieldNumber $ fromIntegral k) v) inpKvs
+        f m (FieldNumber k) v = M.insertWith Then (fromIntegral k) (First v) m
+        f' m (k, v) = f m (FieldNumber $ fromIntegral k) (Decode.VarintField v)
+        z = M.empty
+    in Decode.decodeWire encoded === (Right . fmap reverse . M.fromListWith (<>) . map (\(k, v) -> (fromIntegral k, [Decode.VarintField v])) . reverse $ inpKvs)
+        QC..&&.
+       Decode.decodeWire0 f z id encoded === Right (foldl' f' z inpKvs)
+
+
