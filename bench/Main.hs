@@ -58,17 +58,14 @@ instance (Functor f, Foldable f) => Foldable (Tree f) where
   foldMap f (Branch x t1 t2) =
     (foldMap.foldMap) f t1 <> f x <> (foldMap.foldMap) f t2
 
-data Rose a = Bud | Rose a [Rose a]
-
-instance Foldable Tree where
-  foldr _ z Leaf = z
-  foldr f z (Branch a t1 t2) = foldr f (f a (foldr f z t2)) t1
-
   sum Leaf = 0
   sum (Branch a t1 t2) =
     let !a1 = sum . fmap sum $ t1
         !a2 = sum . fmap sum $ t2
     in a + a1 + a2
+
+data Rose a = Bud | Rose a [Rose a]
+
 
 instance Foldable Rose where
   foldMap f Bud = mempty
@@ -306,6 +303,6 @@ main = do
   defaultMain
     [ bench "Parse int tree" $ C.perRunEnv mkTree (unwrap . decode intTreeParser)
     , C.env mkSmart f
-    , bench "Parse int rose tree" $ C.perRunEnv mkRose (unwrap . decode intRoseParser)]
+    , bench "Parse int rose tree" $ C.perRunEnv mkRose (unwrap . decode intRoseParser)
     ]
 
